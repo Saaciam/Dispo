@@ -1,0 +1,10 @@
+﻿Étape,Transformation,Pourquoi,Avant,Après
+1,Empiler les fichiers Medic'AM,Suivre chaque présentation dans le temps,6 fichiers,16451 présentations sur 32 mois
+2,Mettre à 0 les cases vides et les valeurs négatives,Vide = rien vendu ; négatif = correction de remboursement,"59612 vides, 249 négatives","0 vide, 0 négative"
+3,Convertir les boîtes en unités et regrouper par spécialité (CIS),Une boîte de 90 ne vaut pas une boîte de 30,13692 présentations reliées à la BDPM,9969 spécialités
+4,Nettoyer les signalements ANSM,Sans code CIS on ne peut pas relier ; un doublon compterait deux fois,16384 lignes,15556 signalements uniques reliés
+5,Regrouper les spécialités en traitements,Une autre marque peut servir le patient,9967 spécialités,3001 traitements
+6,Retirer les traitements arrêtés,Un arrêt définitif n'est pas une pénurie,3001 traitements,2809 traitements
+7,Retirer les vaccins,Ils suivent des campagnes,2809 traitements,2769 traitements
+8,Garder 1000 boîtes par mois ou plus,"En dessous, le chiffre est trop instable",2769 traitements,1942 traitements
+9,Appliquer la formule,"Disponibilité = délivré ÷ attendu ; prévision = 100 % − manque × 0,9^h",1942 traitements,1942 traitements et 5394 boîtes calculés
