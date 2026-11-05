@@ -10,6 +10,9 @@ Ouvre un terminal dans ce dossier, puis tape :
 pip install -r requirements.txt
 streamlit run app.py
 ```
+s'il y a une erreur : 
+- python -m pip install --user -r requirements.txt
+- python -m streamlit run app.py
 
 L'application s'ouvre dans ton navigateur. Les résultats d'août 2026 sont déjà inclus : tu peux tester un médicament tout de suite.
 
