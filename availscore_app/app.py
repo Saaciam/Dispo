@@ -1,254 +1,536 @@
 # =============================================================================
 # AvailScore : l'application
-# Quel médicament risque d'être signalé en rupture (ou risque de rupture)
-# à l'ANSM dans les 3 prochains mois ? Modèle utilisé : V4 (le meilleur au test).
 #
-# Lancer :  streamlit run app.py      (depuis le dossier AvailScore_PowerBI)
+# Un pharmacien cherche un médicament et choisit un mois. L'application répond :
+#   1. AUJOURD'HUI : le médicament est-il en rupture de stock ou en tension
+#      d'approvisionnement ? (statut publié par l'ANSM, revérifié automatiquement)
+#   2. POUR LE MOIS CHOISI : quelle est la probabilité d'une déclaration de rupture
+#      ou de risque de rupture, et quelle part pour chacun des deux ?
+#   3. Les équivalents et leur situation.
+#
+# Les données se mettent à jour toutes seules (voir mise_a_jour.py).
+# Lancer (depuis le dossier availscore_app) :  python -m streamlit run app.py
 # =============================================================================
 
 import os
-import subprocess
-import sys
+import pickle
+from datetime import datetime
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-ICI = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(ICI, "python"))
-import moteur  # noqa: E402
+import mise_a_jour
+import moteur
 
+ICI = os.path.dirname(os.path.abspath(__file__))
 RESULTATS = os.path.join(ICI, "resultats")
 EXPORTS = os.path.join(ICI, "exports_power_bi")
-EXPORTS_ATTENDUS = ["Medicam", "Signalements", "Presentations", "Specialites", "Compositions", "Generiques", "MITM"]
+CACHE = os.path.join(ICI, "cache_import")
+PROPRES = ["ventes_par_medicament.csv", "signalements_propres.csv", "fiches_medicaments.csv"]
+PAGES = ["Rechercher un médicament", "Liste à surveiller", "Performance des modèles", "Mise à jour des données"]
+MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
+           "novembre", "décembre"]
 
-st.set_page_config(page_title="AvailScore", page_icon="💊", layout="wide")
-
-
-# ---------- calculs (gardés en mémoire tant que les fichiers ne changent pas) ----------
-def date_fichiers():
-    return max(os.path.getmtime(os.path.join(RESULTATS, f)) for f in
-               ["ventes_par_medicament.csv", "signalements_propres.csv", "fiches_medicaments.csv"])
+st.set_page_config(page_title="AvailScore", layout="wide")
 
 
-@st.cache_data(show_spinner="Construction du tableau médicament × mois…")
-def tableau(_date):
-    ventes, signal, fiches = moteur.charger(RESULTATS)
-    data, dernier = moteur.construire(ventes, signal, fiches)
-    return data, dernier, fiches, ventes, signal
+# ---------------------------------------------------------------- outils
+def pct(x, dec=1):
+    return f"{x * 100:.{dec}f} %".replace(".", ",")
 
 
-@st.cache_resource(show_spinner="Entraînement du modèle V4…")
-def modele(_date):
-    data = tableau(_date)[0]
-    return moteur.entrainer(data)
+def mois_fr(m):
+    return pd.Period(m, "M").strftime("%m/%Y")
 
 
-@st.cache_data(show_spinner="Comparaison des 4 versions…")
-def notes(_date):
-    return moteur.evaluer(tableau(_date)[0])
+def mois_long(m):
+    p = pd.Period(m, "M")
+    return f"{MOIS_FR[p.month - 1]} {p.year}"
+
+
+def barre(texte):
+    """Une barre de progression et la fonction qui la fait avancer."""
+    b = st.progress(0.0, text=texte)
+    return b, lambda f, m: b.progress(min(max(f, 0.0), 1.0), text=f"{m} — {f:.0%}")
+
+
+def lancer_mise_a_jour(telecharger=False):
+    """Refait toute la chaîne avec une barre de progression ; garde le rapport pour l'afficher."""
+    b, avance = barre("Mise à jour des données…")
+    try:
+        rapport = mise_a_jour.tout_mettre_a_jour(avance, telecharger=telecharger)
+    except Exception as e:  # on montre l'erreur, l'ancienne version des données reste utilisable
+        b.empty()
+        st.session_state["rapport"] = {"erreur": str(e)}
+        return False
+    b.empty()
+    rapport["heure"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+    st.session_state["rapport"] = rapport
+    st.cache_resource.clear()
+    return True
+
+
+@st.cache_resource
+def memoire():
+    """Résultats gardés en mémoire pour toutes les sessions, tant que les données ne changent pas.
+    (Pas de @st.cache_resource directement sur les calculs : il interdit d'y afficher une barre de progression.)"""
+    return {}
+
+
+def calcule_une_fois(nom, cle, texte, calcul):
+    """Refait le calcul seulement si les données ont changé, avec une barre de progression."""
+    m = memoire()
+    if m.get(nom, (None,))[0] != cle:
+        b, avance = barre(texte)
+        m[nom] = (cle, calcul(avance))
+        b.empty()
+    return m[nom][1]
+
+
+def evaluation_sur_disque(cle, avance):
+    """La performance prend environ une minute : elle est gardée sur disque pour les lancements suivants."""
+    chemin = os.path.join(CACHE, "performance.pkl")
+    try:
+        with open(chemin, "rb") as f:
+            sauve = pickle.load(f)
+        if sauve["cle"] == cle:
+            return sauve["E"]
+    except Exception:
+        pass
+    E = moteur.evaluer(RESULTATS, P, avance)
+    os.makedirs(CACHE, exist_ok=True)
+    with open(chemin, "wb") as f:
+        pickle.dump({"cle": cle, "E": E}, f)
+    return E
 
 
 @st.cache_data
-def predictions(_date):
-    data, _, fiches, _, _ = tableau(_date)
-    mod, base = modele(_date)
-    p = data[["cis", "mois", "historique_complet", "cible"] + moteur.VARIABLES].copy()
-    p["risque"] = mod.predict_proba(p[moteur.VARIABLES])[:, 1]
-    p["fois_moyenne"] = p.risque / base
-    p["niveau"] = pd.cut(p.fois_moyenne, [-1, 1.5, 3, 1e9], labels=["Faible", "À surveiller", "Élevé"]).astype(str)
-    return p.merge(fiches[["cis", "nom", "titulaire", "atc", "traitement"]], on="cis")
+def catalogue(_date):
+    """Toutes les spécialités de la BDPM (même celles sans prévision) et la table CIP13 -> CIS."""
+    spe = pd.read_csv(os.path.join(EXPORTS, "Specialites.csv"), dtype=str)
+    pres = pd.read_csv(os.path.join(EXPORTS, "Presentations.csv"), dtype=str)
+    return spe, pres.dropna(subset=["cip13"]).drop_duplicates("cip13").set_index("cip13").cis
 
 
-if not os.path.exists(os.path.join(RESULTATS, "fiches_medicaments.csv")):
-    st.error("Les fichiers propres manquent dans resultats/. Va dans l'onglet « Mettre à jour » "
-             "ou lance `python python/1_nettoyage_final.py`.")
+# ------------------------------------------- traitement automatique au lancement
+changes = mise_a_jour.changements()
+manque = not all(os.path.exists(os.path.join(RESULTATS, f)) for f in PROPRES)
+if manque or changes is None or any(changes.values()):
+    if "auto_fait" not in st.session_state:          # une seule tentative par session
+        st.session_state["auto_fait"] = True
+        st.info("Des fichiers de données ont changé (ou n'ont jamais été traités) : "
+                "traitement automatique en cours, l'application réapprendra ensuite le modèle.")
+        lancer_mise_a_jour()
+        st.rerun()
+if manque:
+    st.error("Les fichiers propres manquent dans resultats/ et le traitement automatique a échoué.")
+    st.write(st.session_state.get("rapport", {}).get("erreur", ""))
     st.stop()
 
-DATE = date_fichiers()
-data, dernier_signal, fiches, ventes, signal = tableau(DATE)
-mod, base = modele(DATE)
-P = predictions(DATE)
-mois_dispo = sorted(P.mois.unique())
+# Le statut actuel (rupture, tension) change tous les jours : revérifié au plus toutes les 12 heures.
+if "statuts" not in st.session_state:
+    with st.spinner("Vérification des statuts de disponibilité publiés par l'ANSM…"):
+        st.session_state["statuts"] = mise_a_jour.rafraichir_statuts()
+date_statuts = st.session_state["statuts"]
 
 
-def pct(x):
-    """0.094 -> '9,4 %' (écriture française)"""
-    return f"{x * 100:.1f} %".replace(".", ",")
+# ---------------------------------------------------------------- la prédiction
+cle = (tuple(os.path.getmtime(os.path.join(RESULTATS, f)) for f in PROPRES + ["disponibilite_ansm.csv"]),
+       datetime.now().strftime("%Y-%m"))
+P = calcule_une_fois("prediction", cle, "Prédiction en cours…",
+                     lambda av: moteur.preparer(RESULTATS, av, cache=os.path.join(CACHE, "prediction.pkl")))
+S = P["situation"]
+manifeste = mise_a_jour.lire_manifeste() or {}
 
 
-def fin_horizon(m):
-    p = pd.Period(m, "M")
-    return f"{(p + 1).strftime('%m/%Y')} à {(p + 3).strftime('%m/%Y')}"
-
-
-# ---------- barre latérale ----------
+# ---------------------------------------------------------------- barre latérale
 with st.sidebar:
-    st.title("💊 AvailScore")
-    st.caption("Risque qu'un médicament soit signalé à l'ANSM (rupture ou risque de rupture) "
-               "dans les 3 mois qui suivent.")
-    defaut = mois_dispo.index(dernier_signal) if dernier_signal in mois_dispo else len(mois_dispo) - 1
-    mois = st.selectbox("Situation à la fin du mois de", mois_dispo, index=defaut,
-                        format_func=lambda m: pd.Period(m, "M").strftime("%m/%Y"))
-    st.write(f"**Prédiction pour : {fin_horizon(mois)}**")
-    if mois > dernier_signal:
-        st.warning(f"Les listes ANSM s'arrêtent en {pd.Period(dernier_signal, 'M').strftime('%m/%Y')}. "
-                   "Après cette date, le modèle ne voit pas les signalements récents : "
-                   "il sous-estime le risque des médicaments déjà signalés.")
+    st.title("AvailScore")
+    page = st.radio("Aller à", PAGES, label_visibility="collapsed")
     st.divider()
-    st.caption(f"Modèle : V4 (machine learning). En moyenne, {str(round(base * 100, 1)).replace('.', ',')} % des médicaments sont signalés "
-               "dans les 3 mois. « Élevé » = au moins 3 fois cette moyenne ; "
-               "« À surveiller » = au moins 1,5 fois.")
+    if date_statuts:
+        st.caption(f"**Statuts ANSM vérifiés le :** {date_statuts.strftime('%d/%m/%Y à %H:%M')}")
+    st.caption(f"**Ventes Medic'AM connues jusqu'à :** {mois_fr(S['dernier_vente'])}")
+    st.caption(f"**Déclarations ANSM connues jusqu'à :** {mois_fr(S['dernier_signal'])}")
+    if manifeste.get("date_traitement"):
+        st.caption("**Données traitées le :** "
+                   + datetime.fromisoformat(manifeste["date_traitement"]).strftime("%d/%m/%Y à %H:%M"))
+    if changes and any(changes.values()):
+        st.warning("Des fichiers de donnees/ ont changé depuis le dernier traitement.")
+    if st.button("Relancer la prédiction", width="stretch"):
+        memoire().clear()
+        for f in ("prediction.pkl", "performance.pkl"):
+            if os.path.exists(os.path.join(CACHE, f)):
+                os.remove(os.path.join(CACHE, f))
+        st.rerun()
 
-M = P[P.mois == mois].sort_values("risque", ascending=False).reset_index(drop=True)
-M.index += 1
+r_ = st.session_state.get("rapport")
+if r_ and "erreur" in r_:
+    st.error("La dernière mise à jour a échoué, l'application utilise les données précédentes.\n\n" + r_["erreur"])
 
-onglets = st.tabs(["📋 Liste à surveiller", "🔎 Un médicament", "📊 Le modèle", "🔄 Mettre à jour"])
 
-# ---------- 1. la liste ----------
-with onglets[0]:
-    st.subheader(f"Médicaments les plus à risque pour {fin_horizon(mois)}")
+def choisir_mois(cle_widget):
+    """Le mois en cours et les 5 suivants ; le mois en cours par défaut."""
+    choix = st.segmented_control(
+        "Mois", S["mois"], default=S["maintenant"], key=cle_widget,
+        format_func=lambda m: mois_long(m) + (" (en cours)" if m == S["maintenant"] else ""))
+    return choix or S["maintenant"]
+
+
+def carte_statut(statut_ligne, mitm):
+    """Ce que l'ANSM publie aujourd'hui sur ce médicament."""
+    if statut_ligne is None:
+        st.success("**Aucune rupture ni tension publiée par l'ANSM aujourd'hui.**")
+        if not mitm:
+            st.caption("L'ANSM publie surtout les médicaments d'intérêt thérapeutique majeur (MITM). Ce médicament "
+                       "n'en est pas un : l'absence de statut ne garantit pas qu'il soit disponible partout.")
+        return
+    s = statut_ligne
+    lien = f" — [fiche ANSM]({s.lien})" if isinstance(s.lien, str) else ""
+    maj = f" (mis à jour le {s.date_maj})" if isinstance(s.date_maj, str) else ""
+    if s.statut == "Rupture de stock":
+        st.error(f"**En rupture de stock** depuis le {s.date_debut}{maj}. "
+                 + (f"Remise à disposition prévue le {s.date_remise}." if isinstance(s.date_remise, str) else
+                    "Pas de date de remise à disposition annoncée.") + lien)
+    elif s.statut == "Tension d'approvisionnement":
+        st.warning(f"**Risque de rupture (tension d'approvisionnement)** depuis le {s.date_debut}{maj} : "
+                   "le médicament est encore disponible, mais en quantité limitée." + lien)
+    elif s.statut == "Remise à disposition":
+        depuis = s.date_remise if isinstance(s.date_remise, str) else s.date_maj
+        st.success(f"**De nouveau disponible** depuis le {depuis}, après une rupture ou "
+                   f"une tension commencée le {s.date_debut}." + lien)
+    else:
+        st.info(f"**{s.statut}** depuis le {s.date_debut}{maj}." + lien)
+
+
+# ================================================================ 1. RECHERCHER UN MÉDICAMENT
+if page == PAGES[0]:
+    st.title("Disponibilité d'un médicament")
+    spe, cip_vers_cis = catalogue(manifeste.get("date_traitement"))
+    noms = dict(zip(spe.cis, spe.nom))
+    c1, c2 = st.columns([3, 1])
+    choix = c1.selectbox("Médicament", sorted(noms, key=noms.get), index=None,
+                         format_func=lambda c: f"{noms[c]} ({c})", placeholder="Tapez quelques lettres du nom…")
+    cip = c2.text_input("ou code CIP13 de la boîte", max_chars=13).strip()
+    if cip:
+        if cip in cip_vers_cis.index:
+            choix = cip_vers_cis[cip]
+        else:
+            c2.caption("Code CIP13 inconnu de la BDPM.")
+    mois = choisir_mois("mois_recherche")
+
+    if not choix:
+        st.info(f"Choisissez un médicament pour voir s'il est en rupture aujourd'hui et son risque pour "
+                f"{mois_long(mois)}.")
+    else:
+        b, avance = barre("Prédiction en cours…")
+        avance(0.2, "Statut ANSM actuel")
+        d = P["dispo"][P["dispo"].cis == choix]
+        statut = d.iloc[0] if len(d) else None
+        avance(0.5, f"Calcul du risque pour {mois_long(mois)}")
+        M = moteur.pour_le_mois(P, mois)
+        ligne = M[M.cis == choix]
+        r = ligne.iloc[0] if len(ligne) else None
+        avance(0.8, "Recherche des équivalents")
+        fiche = P["tout"][P["tout"].cis == choix]
+        trait = fiche.traitement.iloc[0] if len(fiche) else None
+        equiv = P["tout"][(P["tout"].traitement == trait) & (P["tout"].cis != choix)] if trait else P["tout"].iloc[:0]
+        avance(1, "Prédiction terminée")
+        b.empty()
+
+        st.subheader(noms.get(choix, choix))
+        info = spe[spe.cis == choix].iloc[0]
+        st.caption(f"CIS {choix} — {info.titulaire} — {info.etat}"
+                   + (f" — ATC {fiche.atc.iloc[0]}" if len(fiche) and isinstance(fiche.atc.iloc[0], str) else ""))
+        mitm = bool(fiche.mitm.iloc[0]) if len(fiche) else False
+
+        # ---- 1. aujourd'hui
+        st.markdown("#### Aujourd'hui")
+        carte_statut(statut, mitm)
+
+        # ---- 2. prévision
+        st.markdown(f"#### Prévision pour {mois_long(mois)}")
+        if r is None:
+            raison = ("il n'est plus commercialisé" if len(fiche) and fiche.arrete.iloc[0] else
+                      "c'est un vaccin (ventes liées aux campagnes)" if len(fiche) and fiche.vaccin.iloc[0] else
+                      "ses ventes en ville sont trop faibles ou inconnues (moins de 100 boîtes par mois)")
+            st.info(f"Pas de prévision pour ce médicament : {raison}. Le statut ANSM ci-dessus reste valable.")
+        else:
+            if statut is not None and statut.statut in ("Rupture de stock", "Tension d'approvisionnement"):
+                st.warning(f"Ce médicament est **déjà en {statut.statut.lower()}** aujourd'hui. La prévision "
+                           "ci-dessous ne peut pas en tenir compte : le modèle ne voit les déclarations qu'avec "
+                           f"{S['retard']} mois de retard (listes ANSM publiées une fois par an). Tant que l'ANSM "
+                           "n'annonce pas de remise à disposition, considérez-le comme indisponible ou à risque.")
+            c = st.columns(4)
+            c[0].metric(f"Déclaration à l'ANSM en {mois_long(mois)}", pct(r.risque),
+                        help="Probabilité que le laboratoire déclare une rupture de stock OU un risque de rupture "
+                             "concernant ce médicament pendant ce mois.")
+            c[1].metric("dont rupture de stock", "≈ " + pct(r.risque_rupture),
+                        help="Le médicament manque : la pharmacie ne peut pas le délivrer dans les 72 heures.")
+            c[2].metric("dont risque de rupture", "≈ " + pct(r.risque_tension),
+                        help="Le laboratoire prévoit des difficultés d'approvisionnement (tension).")
+            c[3].metric("Niveau", r.niveau, f"× {r.fois_moyenne:.1f} la moyenne".replace(".", ","),
+                        delta_color="inverse" if r.fois_moyenne >= 1 else "normal")
+            st.write(f"En moyenne, {pct(r.moyenne)} des médicaments font l'objet d'une déclaration dans un mois "
+                     f"donné. Pour ce médicament, le modèle estime ce risque à **{pct(r.risque)}**, "
+                     f"soit **{f'{r.fois_moyenne:.1f}'.replace('.', ',')} fois la moyenne** "
+                     f"(rang {r.rang} sur {len(M)} médicaments suivis).")
+            st.write(f"**Signes repérés :** {moteur.raisons(r)}.")
+            if pd.notna(r.n_ruptures):
+                hist = f"{int(r.n_ruptures)} rupture(s) et {int(r.n_risques)} risque(s) de rupture déclarés"
+            else:
+                hist = "aucune déclaration"
+            st.caption(f"Répartition rupture / risque de rupture : estimée d'après l'historique de ce médicament "
+                       f"({hist} entre {P['periode_types'][0]} et {P['periode_types'][1]}) et la part nationale "
+                       f"récente ({pct(P['part_rupture_nationale'], 0)} de ruptures). Elle est indicative : "
+                       "les données ANSM ne permettent pas de la prédire précisément.")
+
+            # risque des 6 mois proposés
+            serie = pd.DataFrame({"mois": S["mois"],
+                                  "Risque": [r[f"risque_{S['ecarts'][m]}"] for m in S["mois"]],
+                                  "Moyenne": [P["moyennes"][S["ecarts"][m]] for m in S["mois"]]})
+            serie["Mois"] = serie.mois.map(mois_long)
+            serie["Choisi"] = serie.mois == mois
+            base = alt.Chart(serie).encode(x=alt.X("Mois:N", sort=list(serie.Mois), title=None))
+            g = (base.mark_bar().encode(
+                    y=alt.Y("Risque:Q", axis=alt.Axis(format="%"), title="Probabilité de déclaration"),
+                    color=alt.condition(alt.datum.Choisi, alt.value("#d95f02"), alt.value("#9ecae1")),
+                    tooltip=["Mois", alt.Tooltip("Risque:Q", format=".1%"), alt.Tooltip("Moyenne:Q", format=".1%")])
+                 + base.mark_tick(color="black", thickness=2, size=40).encode(y="Moyenne:Q"))
+            st.write("**Le risque mois par mois** (trait noir : moyenne de tous les médicaments)")
+            st.altair_chart(g, width="stretch")
+
+        # ---- 3. équivalents
+        if len(equiv):
+            st.markdown(f"#### Équivalents (même substance, même dose, même forme) pour {mois_long(mois)}")
+            e = equiv[["cis", "nom", "titulaire"]].merge(P["dispo"][["cis", "statut"]], on="cis", how="left") \
+                .merge(M[["cis", "risque", "niveau"]], on="cis", how="left").sort_values("risque")
+            st.dataframe(pd.DataFrame({
+                "Médicament": e.nom, "Laboratoire": e.titulaire,
+                "Statut ANSM aujourd'hui": e.statut.fillna("aucune alerte publiée"),
+                f"Risque en {mois_long(mois)}": e.risque.map(lambda x: pct(x) if x == x else "pas de prévision"),
+                "Niveau": e.niveau.fillna("—")}), hide_index=True, width="stretch")
+            st.caption("Triés du plus sûr au plus à risque : utile pour choisir une substitution.")
+
+        # ---- 4. historique
+        with st.expander("Historique des ventes et des déclarations"):
+            hv = P["ventes"][P["ventes"].cis == choix].assign(date=lambda x: pd.to_datetime(x.mois + "-01"))
+            sg = P["signal"][P["signal"].cis == choix].copy()
+            if len(hv):
+                pts = sg.assign(date=sg.date.dt.to_period("M").dt.to_timestamp()).drop_duplicates("date") \
+                    .merge(hv[["date", "boites"]], on="date")
+                st.altair_chart(alt.Chart(hv).mark_line().encode(
+                    x=alt.X("date:T", title=None), y=alt.Y("boites:Q", title="Boîtes remboursées par mois"))
+                    + alt.Chart(pts).mark_point(color="red", size=90, filled=True).encode(x="date:T", y="boites:Q"),
+                    width="stretch")
+                st.caption("Points rouges : mois avec au moins une déclaration ANSM.")
+            if len(sg):
+                st.write(f"{len(sg)} déclaration(s) dans les listes ANSM, la dernière le "
+                         f"{sg.date.max().strftime('%d/%m/%Y')}.")
+            else:
+                st.write("Aucune déclaration dans les listes ANSM depuis 2019.")
+
+
+# ================================================================ 2. LISTE À SURVEILLER
+elif page == PAGES[1]:
+    st.title("Médicaments à surveiller")
+    mois = choisir_mois("mois_liste")
+    M = moteur.pour_le_mois(P, mois)
+    st.write(f"Probabilité que le laboratoire déclare à l'ANSM une rupture de stock ou un risque de rupture "
+             f"**pendant {mois_long(mois)}**. En moyenne : {pct(M.moyenne.iloc[0])} des médicaments par mois.")
     c = st.columns(4)
     c[0].metric("Médicaments suivis", f"{len(M):,}".replace(",", " "))
-    c[1].metric("Risque élevé", int((M.niveau == "Élevé").sum()))
-    c[2].metric("À surveiller", int((M.niveau == "À surveiller").sum()))
-    c[3].metric("Risque moyen", pct(M.risque.mean()))
+    c[1].metric("Risque élevé", int((M.niveau == "Élevé").sum()), help="Au moins 3 fois la moyenne")
+    c[2].metric("À surveiller", int((M.niveau == "À surveiller").sum()), help="Au moins 1,5 fois la moyenne")
+    c[3].metric("En rupture aujourd'hui (ANSM)", int((M.statut == "Rupture de stock").sum()))
 
-    f1, f2, f3 = st.columns([2, 1, 1])
-    texte = f1.text_input("Chercher un nom, un laboratoire ou un code ATC", "")
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
+    texte = f1.text_input("Filtrer par nom, laboratoire ou code ATC", "")
     niveaux = f2.multiselect("Niveau", ["Élevé", "À surveiller", "Faible"], default=["Élevé", "À surveiller"])
-    seulement_mitm = f3.checkbox("Seulement les MITM", False)
-
+    statuts = f3.multiselect("Statut ANSM aujourd'hui", ["Rupture de stock", "Tension d'approvisionnement",
+                                                         "Remise à disposition", "aucune alerte"])
+    seulement_mitm = f4.checkbox("MITM")
     V = M[M.niveau.isin(niveaux)]
+    if statuts:
+        V = V[V.statut.fillna("aucune alerte").isin(statuts)]
     if seulement_mitm:
         V = V[V.mitm == 1]
     if texte:
         t = texte.lower()
         V = V[V.nom.str.lower().str.contains(t, regex=False) | V.titulaire.str.lower().str.contains(t, regex=False)
               | V.atc.fillna("").str.lower().str.startswith(t)]
+    vue = pd.DataFrame({"Rang": V.rang, "Médicament": V.nom, "Risque": (V.risque * 100).round(1),
+                        "dont rupture (≈ %)": (V.risque_rupture * 100).round(1),
+                        "dont risque de rupture (≈ %)": (V.risque_tension * 100).round(1),
+                        "Niveau": V.niveau, "Statut ANSM aujourd'hui": V.statut.fillna("—"),
+                        "Pourquoi": V.apply(moteur.raisons, axis=1), "Laboratoire": V.titulaire, "ATC": V.atc})
+    st.dataframe(vue, hide_index=True, width="stretch", height=520,
+                 column_config={"Risque": st.column_config.ProgressColumn(
+                     f"Risque en {mois_long(mois)} (%)", min_value=0, max_value=max(30, float(vue.Risque.max() or 0)),
+                     format="%.1f %%")})
+    st.caption(f"{len(vue)} médicaments affichés. C'est une liste à surveiller, pas une certitude : voir la "
+               "page « Performance des modèles ».")
+    st.download_button("Télécharger la liste (CSV)", vue.to_csv(index=False).encode("utf-8-sig"),
+                       f"availscore_{mois}.csv", "text/csv")
 
-    vue = pd.DataFrame({
-        "Médicament": V.nom, "Risque": (V.risque * 100).round(1), "Niveau": V.niveau,
-        "Pourquoi": V.apply(moteur.raisons, axis=1), "× moyenne": V.fois_moyenne.round(1),
-        "Laboratoire": V.titulaire, "ATC": V.atc})
-    st.dataframe(vue, width="stretch", height=520,
-                 column_config={"Risque": st.column_config.ProgressColumn("Risque (%)", min_value=0, max_value=100,
-                                                                          format="%.1f %%")})
-    st.caption(f"{len(vue)} médicaments affichés. Au test, parmi les 100 premiers de la liste, "
-               "environ 1 sur 3 a vraiment été signalé dans les 3 mois. C'est 4 fois mieux que le hasard, "
-               "mais pas une certitude : c'est une liste à surveiller.")
-    st.download_button("Télécharger la liste (CSV)", vue.to_csv(index_label="Rang").encode("utf-8-sig"),
-                       f"availscore_risque_{mois}.csv", "text/csv")
 
-# ---------- 2. un médicament ----------
-with onglets[1]:
-    noms = M.sort_values("nom")
-    choix = st.selectbox("Choisis un médicament (tape quelques lettres)", noms.cis,
-                         format_func=lambda c: f"{noms.set_index('cis').nom[c]} ({c})")
-    r = M[M.cis == choix].iloc[0]
-    rang = int(M.index[M.cis == choix][0])
+# ================================================================ 3. PERFORMANCE
+elif page == PAGES[2]:
+    st.title("Performance des modèles")
+    E = calcule_une_fois("performance", cle, "Évaluation des modèles en cours (environ une minute)…",
+                         lambda av: evaluation_sur_disque(cle, av))
 
+    st.write(f"Chaque mois proposé a son propre modèle, testé **dans la même situation que la prévision réelle** : "
+             f"déclarations ANSM vues avec {S['retard']} mois de retard, même nombre de mois entre les dernières "
+             "ventes connues et le mois prédit. Le test porte sur les 2 derniers mois dont on connaît la réponse, "
+             "jamais vus pendant l'apprentissage.")
+
+    st.subheader("Fiabilité pour chaque mois proposé")
+    pm = E["par_mois"]
+    st.dataframe(pd.DataFrame({
+        "Mois prédit": pm["Mois prédit"].map(mois_long),
+        "Mois après les dernières ventes": pm["Écart (mois)"],
+        "AUC": pm.AUC.map(lambda x: f"{x:.3f}".replace(".", ",")),
+        "Top 100": pm["Top 100"].map(lambda x: pct(x, 0)),
+        "Hasard": pm["Part déclarée"].map(pct),
+        "Mois d'apprentissage": pm["Mois d'apprentissage"]}), hide_index=True, width="stretch")
+    st.markdown("""
+- **AUC** : on tire un médicament déclaré et un non déclaré ; c'est la chance que le modèle donne le plus gros
+  risque au bon. 0,5 = pile ou face, 1 = parfait.
+- **Top 100** : parmi les 100 médicaments les plus à risque, la part vraiment déclarée pendant le mois.
+  À comparer avec le **hasard** (la part de médicaments déclarés dans un mois).
+- Plus le mois est loin des dernières données, plus la prévision est difficile.""")
+
+    v4 = E["notes"].loc["V4 machine learning"]
+    st.subheader(f"Le détail pour {mois_long(S['maintenant'])} (mois en cours)")
+    st.write(f"Apprentissage jusqu'à {mois_fr(E['fin_appr'])}, test sur "
+             f"{' et '.join(mois_fr(m) for m in E['test_mois'])} ({E['n_test']:,} lignes, dont "
+             f"{pct(E['part'])} déclarées).".replace(",", " "))
     c = st.columns(4)
-    c[0].metric("Risque sur 3 mois", pct(r.risque))
-    c[1].metric("Par rapport à la moyenne", f"× {r.fois_moyenne:.1f}".replace(".", ","))
-    c[2].metric("Niveau", r.niveau)
-    c[3].metric("Rang", f"{rang} / {len(M)}")
-    st.write(f"**{r.nom}** — {r.titulaire} — ATC {r.atc}")
-    st.info("Signes présents : " + moteur.raisons(r) + ".  \nLe modèle les pèse avec les autres informations : "
-            "un signe isolé ne suffit pas à rendre le risque élevé.")
-
-    with st.expander("Le détail des informations vues par le modèle"):
-        st.table(pd.DataFrame({
-            "Information": ["Ventes du mois / mois normal", "Ventes des 3 derniers mois / normal",
-                            "Ventes instables (0 = très régulières)", "Mois avec signalement (3 derniers mois)",
-                            "Mois avec signalement (12 derniers mois)", "Mois avec signalement (24 derniers mois)",
-                            "Part de la famille ATC signalée ce trimestre", "MITM", "Un seul laboratoire",
-                            "Injectable"],
-            "Valeur": [f"{r.ventes_mois:.0%}", f"{r.ventes_3mois:.0%}", f"{r.ventes_instables:.2f}",
-                       int(r.signal_3mois), int(r.signal_12mois), int(r.signal_24mois),
-                       f"{r.classe_signalee:.0%}", "oui" if r.mitm else "non",
-                       "oui" if r.un_seul_labo else "non", "oui" if r.injectable else "non"]}).set_index("Information"))
+    c[0].metric("AUC", f"{v4.AUC:.3f}".replace(".", ","))
+    c[1].metric("AP", f"{v4.AP:.3f}".replace(".", ","), help=f"Le hasard vaut {E['part']:.3f}")
+    c[2].metric("Top 100", pct(v4["Top 100"]), f"× {v4['Top 100'] / E['part']:.1f} le hasard".replace(".", ","))
+    c[3].metric("AUC jamais déclarés", f"{v4['AUC jamais déclarés']:.3f}".replace(".", ","),
+                help="Médicaments sans déclaration sur les 12 derniers mois connus : le cas le plus difficile")
+    st.dataframe(E["notes"].style.format({"AUC": "{:.3f}", "AP": "{:.3f}", "Top 100": "{:.0%}",
+                                          "AUC jamais déclarés": "{:.3f}"}, na_rep="—")
+                 .highlight_max(color="#c7e9c0"), width="stretch")
 
     g1, g2 = st.columns(2)
-    hv = ventes[ventes.cis == choix]
-    hv = hv.assign(date=pd.to_datetime(hv.mois + "-01"))
-    sg = signal[signal.cis == choix].assign(date=lambda x: x.date.dt.to_period("M").dt.to_timestamp())
-    sg = sg.drop_duplicates("date").merge(hv[["date", "boites"]], on="date", how="inner")
-    ligne = alt.Chart(hv).mark_line().encode(x=alt.X("date:T", title=None), y=alt.Y("boites:Q", title="Boîtes remboursées"))
-    points = alt.Chart(sg).mark_point(color="red", size=90, filled=True).encode(x="date:T", y="boites:Q",
-                                                                              tooltip=[alt.Tooltip("date:T", format="%m/%Y")])
-    g1.write("**Boîtes remboursées par mois** (points rouges = mois avec un signalement ANSM)")
-    g1.altair_chart(ligne + points, width="stretch")
+    g1.write("**Les probabilités sont-elles justes ?**")
+    fi = E["fiabilite"].reset_index()
+    g1.dataframe(pd.DataFrame({"Niveau": fi.Niveau, "Médicaments": fi.Médicaments,
+                               "Probabilité annoncée": fi.Risque_prédit.map(pct),
+                               "Vraiment déclarés": fi.Vraiment_déclarés.map(pct)}), hide_index=True, width="stretch")
+    g1.caption("Quand la probabilité annoncée et la part vraiment déclarée sont proches, on peut lire le "
+               "pourcentage affiché comme une vraie probabilité.")
+    g2.write("**Ce qui compte le plus pour le modèle**")
+    g2.altair_chart(alt.Chart(E["importance"].head(10)).mark_bar(color="#1b9e77").encode(
+        x=alt.X("Baisse de l'AUC:Q"), y=alt.Y("Variable:N", sort="-x", title=None),
+        tooltip=["Variable", alt.Tooltip("Baisse de l'AUC:Q", format=".3f")]), width="stretch")
 
-    hr = P[P.cis == choix].assign(date=lambda x: pd.to_datetime(x.mois + "-01"))
-    g2.write("**Risque prédit, mois après mois**")
-    courbe = alt.Chart(hr).mark_line(color="#d95f02").encode(
-        x=alt.X("date:T", title=None), y=alt.Y("risque:Q", title="Risque sur 3 mois", axis=alt.Axis(format="%")))
-    limite = alt.Chart(pd.DataFrame({"date": [pd.to_datetime(dernier_signal + "-01")]})).mark_rule(
-        color="gray", strokeDash=[4, 4]).encode(x="date:T")
-    g2.altair_chart(courbe + limite, width="stretch")
-    g2.caption("Pointillé : fin des listes ANSM. Après, le risque est sous-estimé pour les médicaments déjà signalés.")
+    st.write("**Précision selon la longueur de la liste**")
+    st.altair_chart(alt.Chart(E["courbe"]).mark_line(point=True).encode(
+        x=alt.X("Longueur de la liste:Q", scale=alt.Scale(type="log")),
+        y=alt.Y("Part déclarée:Q", axis=alt.Axis(format="%"), title="Part vraiment déclarée"),
+        color=alt.Color("Version:N", legend=alt.Legend(orient="bottom")),
+        strokeDash=alt.condition(alt.datum.Version == "Hasard", alt.value([4, 4]), alt.value([1, 0])),
+        tooltip=["Version", "Longueur de la liste", alt.Tooltip("Part déclarée:Q", format=".1%")]), width="stretch")
 
-    meme = M[(M.traitement == r.traitement) & (M.cis != choix)]
-    if len(meme):
-        st.write("**Les équivalents (même traitement) et leur risque**")
-        st.dataframe(pd.DataFrame({"Médicament": meme.nom, "Laboratoire": meme.titulaire,
-                                   "Risque (%)": (meme.risque * 100).round(1), "Niveau": meme.niveau}),
-                     width="stretch", hide_index=True)
+    st.subheader("Rupture ou risque de rupture ?")
+    T = E["types"]
+    if T:
+        st.write(f"Test sur les {T['n']:,} déclarations de {T['annee']} : la part de ruptures estimée d'après "
+                 f"l'historique de chaque médicament obtient une AUC de **{T['AUC']:.2f}**.".replace(",", " ")
+                 .replace(".", ",") + f" La part réelle était de {pct(T['part_reelle'], 0)}, pour "
+                 f"{pct(T['part_prevue'], 0)} annoncés. La séparation entre rupture et risque de rupture est donc "
+                 "**indicative** : elle repose surtout sur la tendance nationale.")
+    else:
+        st.write("Ajoutez le fichier Data.ansm « historique ruptures » dans donnees/ansm_historique/ "
+                 "pour estimer la part de ruptures.")
 
-# ---------- 3. le modèle ----------
-with onglets[2]:
-    st.subheader("Pourquoi la version 4 ?")
-    tab_notes, n_test, part = notes(DATE)
-    st.write(f"On a comparé 4 versions sur des mois **jamais vus pendant l'apprentissage** "
-             f"(août et septembre 2025, {n_test:_} lignes, dont {pct(part)} signalées).".replace("_", " "))
-    st.dataframe(tab_notes.style.format({"AUC": "{:.3f}", "AP": "{:.3f}", "Top 100": "{:.0%}"})
-                 .highlight_max(color="#c7e9c0"), width="stretch")
-    st.markdown("""
-- **AUC** : on prend au hasard un médicament signalé et un non signalé. C'est la chance que le modèle
-  donne le plus gros risque au bon. 0,5 = pile ou face, 1 = parfait.
-- **AP** : la qualité du haut de la liste, de 0 à 1. Le hasard vaut la part de signalés (environ 0,09).
-- **Top 100** : parmi les 100 médicaments les plus à risque, la part vraiment signalée dans les 3 mois.
+    st.subheader("Les limites")
+    st.markdown(f"""
+- Les listes ANSM sont publiées une fois par an : les déclarations sont connues jusqu'à {mois_fr(S['dernier_signal'])}.
+  Le modèle en tient compte, mais ce retard réduit sa précision. Chaque nouvelle liste l'améliore.
+- Une déclaration dans un mois donné est un événement rare (environ 3 % des médicaments). Même un risque
+  « élevé » reste souvent inférieur à 20 %.
+- Les ventes Medic'AM ne couvrent que la ville (pas les médicaments délivrés à l'hôpital).
+- Le statut « aujourd'hui » vient directement de l'ANSM. Il couvre surtout les médicaments d'intérêt
+  thérapeutique majeur.""")
 
-La **V4 gagne sur les trois notes**, et elle gagnait aussi lors de la validation croisée dans le temps.
-C'est elle que l'application utilise. Pour la mise en service, elle réapprend sur tous les mois dont on connaît
-la réponse (juillet 2024 à septembre 2025).
 
-**Les limites, à dire à l'oral.** Les listes ANSM s'arrêtent fin 2025. L'historique est court (15 mois avec
-réponse). Le modèle repère surtout les médicaments MITM, déjà signalés, ou dont les ventes baissent. Une
-rupture totalement inattendue reste difficile à prévoir.
-""")
+# ================================================================ 4. MISE À JOUR
+else:
+    st.title("Mise à jour des données")
+    st.write("Le traitement est **automatique** : au lancement, l'application compare les fichiers de "
+             "`donnees/` à ceux du dernier traitement. Si un fichier a été ajouté, remplacé ou supprimé, elle "
+             "relit les fichiers bruts, **vérifie leur format**, refait les 7 tables, relance le nettoyage, "
+             "puis réapprend les modèles. Un fichier au format inattendu arrête tout avant d'écraser les données. "
+             "Le statut de disponibilité publié par l'ANSM est revérifié toutes les 12 heures.")
 
-# ---------- 4. mettre à jour ----------
-with onglets[3]:
-    st.subheader("Mettre à jour avec de nouveaux exports Power BI")
-    st.write("1. Dans Power BI, actualise les requêtes, puis exporte les 7 tables avec DAX Studio.  \n"
-             "2. Dépose les 7 CSV ici.  \n"
-             "3. Clique sur **Relancer le nettoyage**. L'application réapprend le modèle toute seule.")
-    fichiers = st.file_uploader("Les 7 exports (Medicam.csv, Signalements.csv, Presentations.csv, "
-                                "Specialites.csv, Compositions.csv, Generiques.csv, MITM.csv)",
-                                type="csv", accept_multiple_files=True)
-    if fichiers:
-        for f in fichiers:
-            nom = os.path.splitext(f.name)[0]
-            if nom in EXPORTS_ATTENDUS:
-                with open(os.path.join(EXPORTS, f.name), "wb") as out:
+    rapport = st.session_state.get("rapport")
+    if rapport and "erreur" not in rapport:
+        st.success(f"Dernière mise à jour réussie le {rapport['heure']}.")
+        if rapport.get("telecharges") is not None:
+            st.write("Fichiers téléchargés et modifiés : "
+                     + (", ".join(rapport["telecharges"]) if rapport["telecharges"] else "aucun (déjà à jour)"))
+        for a in rapport.get("avertissements", []):
+            st.caption(a)
+        av, ap = rapport.get("avant", {}), rapport.get("apres", {})
+        lignes = [{"Indicateur": k, "Avant": str(av.get(k, "—")), "Après": str(ap.get(k, "—")),
+                   "Changé": "oui" if str(av.get(k)) != str(ap.get(k)) else ""} for k in dict.fromkeys([*av, *ap])]
+        st.dataframe(pd.DataFrame(lignes), hide_index=True, width="stretch")
+        with st.expander("Journal du nettoyage"):
+            st.code(rapport.get("journal", ""))
+
+    st.subheader("1. Télécharger les dernières données officielles")
+    st.write("BDPM (base-donnees-publique.medicaments.gouv.fr), nouvelles listes ANSM des ruptures et risques de "
+             "rupture (ansm.sante.fr), nouveaux semestres Medic'AM (data.gouv.fr). Chaque fichier est vérifié, "
+             "puis tout le traitement est refait.")
+    if st.button("Télécharger et mettre à jour", type="primary"):
+        if lancer_mise_a_jour(telecharger=True):
+            st.rerun()
+        st.error(st.session_state["rapport"]["erreur"])
+
+    st.subheader("2. Ajouter des fichiers à la main")
+    st.write("Un fichier qui porte le même nom qu'un fichier existant le remplace.")
+    u = st.columns(4)
+    depots = {"ansm": u[0].file_uploader("Listes ANSM (.xlsx)", type=["xlsx", "xls"], accept_multiple_files=True),
+              "medicam": u[1].file_uploader("Medic'AM (.xls, .xlsx)", type=["xls", "xlsx"], accept_multiple_files=True),
+              "bdpm": u[2].file_uploader("Fichiers BDPM (.txt)", type=["txt"], accept_multiple_files=True),
+              "ansm_historique": u[3].file_uploader("Data.ansm historique ruptures (.xlsx)", type=["xlsx"],
+                                                    accept_multiple_files=True)}
+    a_traiter = sum(len(v or []) for v in depots.values())
+    if a_traiter and st.button(f"Enregistrer {a_traiter} fichier(s) et mettre à jour", type="primary"):
+        for dossier, fichiers in depots.items():
+            for f in fichiers or []:
+                nom = os.path.basename(f.name)
+                if dossier == "bdpm" and nom not in mise_a_jour.BDPM:
+                    st.warning(f"{nom} ignoré : les fichiers BDPM attendus sont {', '.join(mise_a_jour.BDPM)}.")
+                    continue
+                os.makedirs(os.path.join(mise_a_jour.DONNEES, dossier), exist_ok=True)
+                with open(os.path.join(mise_a_jour.DONNEES, dossier, nom), "wb") as out:
                     out.write(f.getbuffer())
-                st.write(f"✅ {f.name} enregistré")
-            else:
-                st.write(f"⚠️ {f.name} ignoré : nom inattendu")
-    presents = [n for n in EXPORTS_ATTENDUS if os.path.exists(os.path.join(EXPORTS, n + ".csv"))]
-    st.caption(f"Exports présents : {len(presents)}/7")
-    if st.button("Relancer le nettoyage", type="primary", disabled=len(presents) < 7):
-        with st.spinner("Nettoyage Python en cours…"):
-            res = subprocess.run([sys.executable, "1_nettoyage_final.py"], cwd=os.path.join(ICI, "python"),
-                                 capture_output=True, text=True)
-        if res.returncode == 0:
-            st.success("Terminé.")
-            st.code(res.stdout)
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.button("Recharger l'application")
-        else:
-            st.error("Le nettoyage a échoué :")
-            st.code(res.stderr[-3000:])
+        if lancer_mise_a_jour():
+            st.rerun()
+        st.error(st.session_state["rapport"]["erreur"])
+
+    st.subheader("3. Relancer le traitement")
+    if st.button("Refaire tout le traitement avec les fichiers actuels"):
+        if lancer_mise_a_jour():
+            st.rerun()
+        st.error(st.session_state["rapport"]["erreur"])
+
+    st.subheader("Fichiers utilisés")
+    ch = mise_a_jour.changements() or {}
+    etat = {f: "ajouté depuis le dernier traitement" for f in ch.get("ajoutés", [])}
+    etat.update({f: "modifié depuis le dernier traitement" for f in ch.get("modifiés", [])})
+    st.dataframe(pd.DataFrame([{"Fichier": f, "Taille (Ko)": round(t / 1024),
+                                "Modifié le": datetime.fromtimestamp(d).strftime("%d/%m/%Y %H:%M"),
+                                "État": etat.get(f, "traité")}
+                               for f, (t, d) in mise_a_jour.empreinte().items()]),
+                 hide_index=True, width="stretch")
+    if ch.get("supprimés"):
+        st.caption("Supprimés depuis le dernier traitement : " + ", ".join(ch["supprimés"]))

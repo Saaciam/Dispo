@@ -21,8 +21,9 @@ import re
 import unicodedata
 import pandas as pd
 
-ENTREE = "../exports_power_bi"
-SORTIE = "../resultats"
+ICI = os.path.dirname(os.path.abspath(__file__))
+ENTREE = os.path.join(ICI, "..", "exports_power_bi")
+SORTIE = os.path.join(ICI, "..", "resultats")
 os.makedirs(SORTIE, exist_ok=True)
 
 
@@ -183,7 +184,10 @@ print("Arrêtés :", int(fiches.arrete.sum()), "| vaccins :", int(fiches.vaccin.
 
 # %% ÉTAPE 8 : signalements : garder ceux qu'on relie à un médicament, un seul par jour
 signal = signal.dropna(subset=["cis"])
-signal["date"] = pd.to_datetime(signal.date, format="mixed", dayfirst=True, errors="coerce")
+# Date ISO (2022-01-04) ou française (04/01/2022). Attention : lire '2022-01-04' avec dayfirst
+# donnait le 1er avril au lieu du 4 janvier ; on essaie donc les deux formats explicitement.
+iso = pd.to_datetime(signal.date.str[:10], format="%Y-%m-%d", errors="coerce")
+signal["date"] = iso.fillna(pd.to_datetime(signal.date.str[:10], format="%d/%m/%Y", errors="coerce"))
 signal = signal.dropna(subset=["date"]).drop_duplicates(["cis", "date"]).sort_values("date")
 print("Signalements reliés :", len(signal), "du", signal.date.min().date(), "au", signal.date.max().date())
 

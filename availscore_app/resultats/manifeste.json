@@ -1,0 +1,101 @@
+{
+ "date_traitement": "2026-11-12T21:05:47",
+ "fichiers": {
+  "donnees/ansm/20210909-signalements-ruptures-de-stock-2020-4.xlsx": [
+   128269,
+   1794513855
+  ],
+  "donnees/ansm/20211018-signalements-ruptures-de-stock-2019.xlsx": [
+   78894,
+   1794513855
+  ],
+  "donnees/ansm/20251016-rs-liste-medicaments-2021-2022-2023.xlsx": [
+   482551,
+   1794438471
+  ],
+  "donnees/ansm/20260401-rs-liste-ruptures-medicaments-2024.xlsx": [
+   204536,
+   1794438471
+  ],
+  "donnees/ansm/20260401-rs-liste-ruptures-medicaments-2025.xlsx": [
+   207724,
+   1794438471
+  ],
+  "donnees/ansm_historique/260302-cada26v21-data-ansm-historique-ruptures-2026.xlsx": [
+   493738,
+   1794513852
+  ],
+  "donnees/bdpm/CIS_CIP_Dispo_Spec.txt": [
+   158130,
+   1794514443
+  ],
+  "donnees/bdpm/CIS_CIP_bdpm.txt": [
+   4149158,
+   1794438471
+  ],
+  "donnees/bdpm/CIS_COMPO_bdpm.txt": [
+   2735840,
+   1794438471
+  ],
+  "donnees/bdpm/CIS_GENER_bdpm.txt": [
+   1219514,
+   1794438471
+  ],
+  "donnees/bdpm/CIS_MITM.txt": [
+   1618769,
+   1794512134
+  ],
+  "donnees/bdpm/CIS_bdpm.txt": [
+   3175357,
+   1794438471
+  ],
+  "donnees/medicam/2021-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   18882048,
+   1794513866
+  ],
+  "donnees/medicam/2021-07-a-12_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   19394560,
+   1794513877
+  ],
+  "donnees/medicam/2022-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   17334784,
+   1794513889
+  ],
+  "donnees/medicam/2022-07-a-12_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   18014208,
+   1794513897
+  ],
+  "donnees/medicam/2023-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   17298944,
+   1794513907
+  ],
+  "donnees/medicam/2023-07-a-12_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   17782272,
+   1794513915
+  ],
+  "donnees/medicam/2024-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   17285120,
+   1794438471
+  ],
+  "donnees/medicam/2024-07-a-12_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   16295936,
+   1794438470
+  ],
+  "donnees/medicam/2025-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   16049152,
+   1794438471
+  ],
+  "donnees/medicam/2025-07-a-12_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   16312320,
+   1794438471
+  ],
+  "donnees/medicam/2026-01-a-06_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   15779328,
+   1794438471
+  ],
+  "donnees/medicam/2026-07-a-08_medic-am-par-type-de-prescripteur_serie-mensuelle.xls": [
+   10164736,
+   1794438471
+  ]
+ }
+}
