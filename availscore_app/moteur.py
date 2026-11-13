@@ -307,18 +307,29 @@ def evaluer(dossier, P, avance=rien):
         fin = plus_mois(test_mois[0], -h)
         return d[d.mois <= fin], d[d.mois.isin(test_mois)], fin, test_mois
 
-    # 1. Une ligne par mois proposé
-    par_mois = []
+    # 1. Une ligne par mois proposé. On garde le jeu de test et les modèles entraînés SANS les mois
+    #    du test : la page « Évaluation » s'en sert pour tester des exemples un par un.
+    par_mois, tests = [], {}
     for i, m in enumerate(S["mois"]):
         h = S["ecarts"][m]
         avance(0.30 + 0.30 * i / len(S["mois"]), f"Test du modèle pour {pd.Period(m, 'M').strftime('%m/%Y')}")
         a, t, fin, tm = decoupe(h)
-        s = modele_v4().fit(a[VARIABLES], a[f"cible_{h}"]).predict_proba(t[VARIABLES])[:, 1]
-        y = t[f"cible_{h}"]
+        c = f"cible_{h}"
+        v3 = modele_v3().fit(a[VARIABLES], a[c])
+        v4 = modele_v4().fit(a[VARIABLES], a[c])
+        s = v4.predict_proba(t[VARIABLES])[:, 1]
+        y = t[c]
         par_mois.append({"Mois prédit": m, "Écart (mois)": h, "AUC": roc_auc_score(y, s),
                          "AP": average_precision_score(y, s), "Top 100": top_k(t.mois, y, s),
                          "Part déclarée": y.mean(), "Brier": brier_score_loss(y, s),
                          "Mois d'apprentissage": a.mois.nunique()})
+        jeu = t[["cis", "mois"] + VARIABLES].assign(cible=y.values).reset_index(drop=True)
+        jeu["mois_predit"] = jeu.mois.map(lambda x: plus_mois(x, h))
+        jeu["v1"] = jeu.signal_12mois
+        jeu["v2"] = v2_points(jeu)
+        jeu["v3"] = v3.predict_proba(jeu[VARIABLES])[:, 1]
+        jeu["v4"] = s
+        tests[h] = {"jeu": jeu, "v3": v3, "v4": v4, "moyenne": a[c].mean(), "fin_appr": fin, "test_mois": tm}
     par_mois = pd.DataFrame(par_mois)
 
     # 2. Détail pour le mois en cours
@@ -326,8 +337,7 @@ def evaluer(dossier, P, avance=rien):
     a, t, fin, test_mois = decoupe(h)
     c = f"cible_{h}"
     avance(0.62, "Comparaison des 4 versions pour le mois en cours")
-    v3 = modele_v3().fit(a[VARIABLES], a[c])
-    v4 = modele_v4().fit(a[VARIABLES], a[c])
+    v3, v4 = tests[h]["v3"], tests[h]["v4"]
     scores = {"V1 répéter le passé": t.signal_12mois.values, "V2 points à la main": v2_points(t).values,
               "V3 points appris": v3.predict_proba(t[VARIABLES])[:, 1],
               "V4 machine learning": v4.predict_proba(t[VARIABLES])[:, 1]}
@@ -374,7 +384,38 @@ def evaluer(dossier, P, avance=rien):
     avance(1, "Performance calculée")
     return {"par_mois": par_mois, "notes": notes, "courbe": courbe, "fiabilite": fiab, "importance": importance,
             "test_mois": test_mois, "fin_appr": fin, "n_test": len(t), "part": t[c].mean(), "ecart": h,
-            "types": types_test}
+            "types": types_test, "tests": tests}
+
+
+# ------------------------------------------------------------------ évaluation exemple par exemple
+VERSIONS = {"v1": "V1 répéter le passé", "v2": "V2 points à la main", "v3": "V3 points appris",
+            "v4": "V4 machine learning"}
+
+
+def alertes(jeu, moyenne):
+    """Quand chaque version « donne l'alerte » : V1 si déclaré sur les 12 derniers mois connus,
+    V2 à partir de 3 points, V3 et V4 si la probabilité atteint 1,5 fois la moyenne (niveau « À surveiller »)."""
+    return {"v1": jeu.v1 > 0, "v2": jeu.v2 >= 3, "v3": jeu.v3 >= 1.5 * moyenne, "v4": jeu.v4 >= 1.5 * moyenne}
+
+
+def verdict(alerte, declare):
+    if alerte:
+        return "Alerte justifiée" if declare else "Fausse alerte"
+    return "Déclaration manquée" if declare else "Pas d'alerte, à raison"
+
+
+def matrice(jeu, moyenne):
+    """Pour chaque version, le décompte des 4 verdicts sur tout le jeu de test, et deux taux simples."""
+    lignes = []
+    for v, a in alertes(jeu, moyenne).items():
+        y = jeu.cible.astype(bool)
+        vp, fp = int((a & y).sum()), int((a & ~y).sum())
+        fn, vn = int((~a & y).sum()), int((~a & ~y).sum())
+        lignes.append({"Version": VERSIONS[v], "Alerte justifiée": vp, "Fausse alerte": fp,
+                       "Déclaration manquée": fn, "Pas d'alerte, à raison": vn,
+                       "Alertes justes (précision)": vp / max(1, vp + fp),
+                       "Déclarations repérées (rappel)": vp / max(1, vp + fn)})
+    return pd.DataFrame(lignes)
 
 
 def raisons(r):

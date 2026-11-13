@@ -17,6 +17,7 @@ import pickle
 from datetime import datetime
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -28,7 +29,8 @@ RESULTATS = os.path.join(ICI, "resultats")
 EXPORTS = os.path.join(ICI, "exports_power_bi")
 CACHE = os.path.join(ICI, "cache_import")
 PROPRES = ["ventes_par_medicament.csv", "signalements_propres.csv", "fiches_medicaments.csv"]
-PAGES = ["Rechercher un médicament", "Liste à surveiller", "Performance des modèles", "Mise à jour des données"]
+PAGES = ["Rechercher un médicament", "Liste à surveiller", "Performance des modèles", "Évaluation des modèles",
+         "Mise à jour des données"]
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
            "novembre", "décembre"]
 
@@ -36,6 +38,15 @@ st.set_page_config(page_title="AvailScore", layout="wide")
 
 
 # ---------------------------------------------------------------- outils
+def nb(x):
+    """12345 -> '12 345'"""
+    return f"{int(x):,}".replace(",", " ")
+
+
+def points(n):
+    return f"{int(n)} point" + ("s" if int(n) > 1 else "")
+
+
 def pct(x, dec=1):
     return f"{x * 100:.{dec}f} %".replace(".", ",")
 
@@ -94,7 +105,7 @@ def evaluation_sur_disque(cle, avance):
     try:
         with open(chemin, "rb") as f:
             sauve = pickle.load(f)
-        if sauve["cle"] == cle:
+        if sauve["cle"] == cle and "tests" in sauve["E"]:
             return sauve["E"]
     except Exception:
         pass
@@ -405,8 +416,8 @@ elif page == PAGES[2]:
     v4 = E["notes"].loc["V4 machine learning"]
     st.subheader(f"Le détail pour {mois_long(S['maintenant'])} (mois en cours)")
     st.write(f"Apprentissage jusqu'à {mois_fr(E['fin_appr'])}, test sur "
-             f"{' et '.join(mois_fr(m) for m in E['test_mois'])} ({E['n_test']:,} lignes, dont "
-             f"{pct(E['part'])} déclarées).".replace(",", " "))
+             f"{' et '.join(mois_fr(m) for m in E['test_mois'])} ({nb(E['n_test'])} lignes, dont "
+             f"{pct(E['part'])} déclarées).")
     c = st.columns(4)
     c[0].metric("AUC", f"{v4.AUC:.3f}".replace(".", ","))
     c[1].metric("AP", f"{v4.AP:.3f}".replace(".", ","), help=f"Le hasard vaut {E['part']:.3f}")
@@ -441,9 +452,9 @@ elif page == PAGES[2]:
     st.subheader("Rupture ou risque de rupture ?")
     T = E["types"]
     if T:
-        st.write(f"Test sur les {T['n']:,} déclarations de {T['annee']} : la part de ruptures estimée d'après "
-                 f"l'historique de chaque médicament obtient une AUC de **{T['AUC']:.2f}**.".replace(",", " ")
-                 .replace(".", ",") + f" La part réelle était de {pct(T['part_reelle'], 0)}, pour "
+        st.write(f"Test sur les {nb(T['n'])} déclarations de {T['annee']} : la part de ruptures estimée d'après "
+                 f"l'historique de chaque médicament obtient une AUC de **{T['AUC']:.2f}**.".replace(".", ",")
+                 + f" La part réelle était de {pct(T['part_reelle'], 0)}, pour "
                  f"{pct(T['part_prevue'], 0)} annoncés. La séparation entre rupture et risque de rupture est donc "
                  "**indicative** : elle repose surtout sur la tendance nationale.")
     else:
@@ -461,7 +472,181 @@ elif page == PAGES[2]:
   thérapeutique majeur.""")
 
 
-# ================================================================ 4. MISE À JOUR
+# ================================================================ 4. ÉVALUATION
+elif page == PAGES[3]:
+    st.title("Évaluation des modèles")
+    E = calcule_une_fois("performance", cle, "Évaluation des modèles en cours (environ une minute)…",
+                         lambda av: evaluation_sur_disque(cle, av))
+    st.write("Ici, on teste les modèles **exemple par exemple** sur le jeu de test : des mois passés dont on "
+             "connaît la réponse, mais que les modèles n'ont **jamais vus** pendant l'apprentissage. On compare "
+             "ce que chaque version prédisait avec ce qui s'est vraiment passé, puis avec l'ensemble du jeu de test.")
+
+    mois_choisi = choisir_mois("mois_eval")
+    h = S["ecarts"][mois_choisi]
+    T = E["tests"][h]
+    jeu, moyenne = T["jeu"], T["moyenne"]
+    noms_tout = dict(zip(P["tout"].cis, P["tout"].nom))
+    st.caption(f"Modèle utilisé pour prédire {mois_long(mois_choisi)} : il prédit {h} mois après les dernières "
+               f"ventes connues, avec des déclarations vues {S['retard']} mois en retard. Pour le test, il a appris "
+               f"jusqu'à {mois_fr(T['fin_appr'])}, puis il a prédit "
+               f"{' et '.join(mois_long(plus) for plus in sorted(jeu.mois_predit.unique()))} "
+               f"({nb(len(jeu))} exemples, dont {pct(jeu.cible.mean())} vraiment déclarés).")
+
+    # ---------------- résultats sur tout le jeu de test
+    st.subheader("1. Les résultats sur tout le jeu de test")
+    mat = moteur.matrice(jeu, moyenne)
+    st.dataframe(mat.style.format({"Alertes justes (précision)": "{:.1%}", "Déclarations repérées (rappel)": "{:.1%}"}),
+                 hide_index=True, width="stretch")
+    st.caption(f"Une version « donne l'alerte » quand : V1, le médicament a été déclaré sur les 12 derniers mois "
+               f"connus ; V2, il a au moins 3 points ; V3 et V4, sa probabilité atteint 1,5 fois la moyenne "
+               f"({pct(1.5 * moyenne)}), c'est-à-dire le niveau « À surveiller ». La **précision** est la part des "
+               "alertes qui étaient justifiées ; le **rappel** est la part des déclarations qui ont été repérées.")
+
+    # ---------------- choisir un exemple
+    st.subheader("2. Tester un exemple")
+    cle_m, cle_c = f"ex_mois_{h}", f"ex_cis_{h}"
+    mois_dispo = sorted(jeu.mois_predit.unique())
+    al4 = moteur.alertes(jeu, moyenne)["v4"]
+
+    def tirer(filtre):
+        """Choisit un exemple au hasard parmi ceux qui respectent le filtre."""
+        candidats = jeu[filtre]
+        if len(candidats):
+            x = candidats.sample(1).iloc[0]
+            st.session_state[cle_m], st.session_state[cle_c] = x.mois_predit, x.cis
+
+    b = st.columns(5)
+    b[0].button("Au hasard", on_click=tirer, args=(jeu.cible >= 0,), width="stretch")
+    b[1].button("Un médicament déclaré", on_click=tirer, args=(jeu.cible == 1,), width="stretch")
+    b[2].button("Un non déclaré", on_click=tirer, args=(jeu.cible == 0,), width="stretch")
+    b[3].button("Une fausse alerte V4", on_click=tirer, args=(al4 & (jeu.cible == 0),), width="stretch")
+    b[4].button("Une déclaration manquée V4", on_click=tirer, args=(~al4 & (jeu.cible == 1),), width="stretch")
+
+    c1, c2 = st.columns([1, 3])
+    if st.session_state.get(cle_m) not in mois_dispo:
+        st.session_state[cle_m] = mois_dispo[-1]
+    m_ex = c1.selectbox("Mois prédit", mois_dispo, key=cle_m, format_func=mois_long)
+    du_mois = jeu[jeu.mois_predit == m_ex]
+    options = sorted(du_mois.cis, key=lambda c: noms_tout.get(c, c))
+    if st.session_state.get(cle_c) not in options:
+        st.session_state[cle_c] = du_mois.sort_values("v4", ascending=False).cis.iloc[0]
+    cis_ex = c2.selectbox("Médicament", options, key=cle_c, format_func=lambda c: f"{noms_tout.get(c, c)} ({c})")
+    ex = du_mois[du_mois.cis == cis_ex].iloc[0]
+    alertes_ex = {v: bool(a[ex.name]) for v, a in moteur.alertes(jeu, moyenne).items()}
+
+    # ce qui s'est vraiment passé
+    st.markdown(f"**{noms_tout.get(cis_ex, cis_ex)}** — situation à la fin de {mois_long(ex.mois)}, "
+                f"prédiction pour **{mois_long(m_ex)}**")
+    decl = P["signal"][(P["signal"].cis == cis_ex) & (P["signal"].date.dt.strftime("%Y-%m") == m_ex)]
+    if ex.cible == 1:
+        detail = ", ".join(sorted(decl.date.dt.strftime("%d/%m/%Y").unique()))
+        st.error(f"**Réalité : déclaré à l'ANSM en {mois_long(m_ex)}** ({len(decl)} déclaration(s), le {detail}).")
+    else:
+        st.success(f"**Réalité : aucune déclaration à l'ANSM en {mois_long(m_ex)}.**")
+
+    # ce que chaque version prédisait
+    rang = {v: int((du_mois[v] > ex[v]).sum()) + 1 for v in ["v1", "v2", "v3", "v4"]}
+    valeur = {"v1": f"{int(ex.v1)} mois déclaré(s) sur 12", "v2": points(ex.v2),
+              "v3": pct(ex.v3), "v4": pct(ex.v4)}
+    st.dataframe(pd.DataFrame({
+        "Version": [moteur.VERSIONS[v] for v in valeur],
+        "Prédiction": list(valeur.values()),
+        "Rang dans le mois": [f"{rang[v]} sur {len(du_mois)}" for v in valeur],
+        "Alerte ?": ["oui" if alertes_ex[v] else "non" for v in valeur],
+        "Verdict": [moteur.verdict(alertes_ex[v], ex.cible == 1) for v in valeur]}),
+        hide_index=True, width="stretch")
+
+    # comparaison avec le jeu de test
+    tranches = pd.qcut(jeu.v4.rank(method="first"), 10, labels=False)
+    par_tranche = (jeu.assign(tranche=tranches).groupby("tranche")
+                   .agg(Risque_min=("v4", "min"), Risque_max=("v4", "max"), Prédit=("v4", "mean"),
+                        Réel=("cible", "mean"), Exemples=("cible", "size")).reset_index())
+    t_ex = int(tranches[ex.name])
+    ligne_t = par_tranche.iloc[t_ex]
+    st.write(f"**Comparaison avec le jeu de test :** la V4 donnait {pct(ex.v4)}. Parmi les "
+             f"{nb(ligne_t.Exemples)} exemples du jeu de test dont le risque V4 était proche "
+             f"(entre {pct(ligne_t.Risque_min)} et {pct(ligne_t.Risque_max)}), **{pct(ligne_t.Réel)} ont vraiment "
+             f"été déclarés**, pour {pct(ligne_t.Prédit)} annoncés en moyenne.")
+    par_tranche["Tranche"] = [f"{i + 1}" for i in par_tranche.tranche]
+    par_tranche["Exemple"] = par_tranche.tranche == t_ex
+    longue = par_tranche.melt(id_vars=["Tranche", "Exemple"], value_vars=["Prédit", "Réel"],
+                              var_name="Mesure", value_name="Part")
+    st.altair_chart(alt.Chart(longue).mark_bar().encode(
+        x=alt.X("Tranche:N", title="Tranches de risque V4, de la plus faible (1) à la plus forte (10)"),
+        xOffset="Mesure:N",
+        y=alt.Y("Part:Q", axis=alt.Axis(format="%"), title="Part déclarée"),
+        color=alt.Color("Mesure:N", scale=alt.Scale(domain=["Prédit", "Réel"], range=["#9ecae1", "#d95f02"]),
+                        legend=alt.Legend(orient="bottom", title=None)),
+        opacity=alt.condition(alt.datum.Exemple, alt.value(1), alt.value(0.45)),
+        tooltip=["Tranche", "Mesure", alt.Tooltip("Part:Q", format=".1%")]), width="stretch")
+    st.caption(f"La tranche de l'exemple (n° {t_ex + 1}) est en couleur pleine. Si les barres « Prédit » et "
+               "« Réel » se ressemblent, les probabilités du modèle sont fiables.")
+
+    # ---------------- modifier l'exemple à la main
+    st.subheader("3. Modifier l'exemple à la main")
+    st.write("Changez les informations de l'exemple pour voir comment la prédiction réagit. Les valeurs de départ "
+             "sont celles de l'exemple choisi.")
+    with st.form(f"simulation_{h}_{cis_ex}_{m_ex}"):
+        col = st.columns(3)
+        v = {}
+        v["ventes_mois"] = col[0].number_input("Ventes du mois / mois normal", 0.0, 2.0, float(ex.ventes_mois), 0.05)
+        v["ventes_3mois"] = col[0].number_input("Ventes des 3 derniers mois / normal", 0.0, 2.0, float(ex.ventes_3mois), 0.05)
+        v["tendance_6mois"] = col[0].number_input("Tendance sur 6 mois (-2 à 2)", -2.0, 2.0, float(ex.tendance_6mois), 0.05)
+        v["ventes_instables"] = col[0].number_input("Ventes irrégulières (0 = très régulières)", 0.0, 3.0,
+                                                    float(ex.ventes_instables), 0.05)
+        boites = col[0].number_input("Unités vendues par mois (moyenne)", 0, 10**9, int(round(10 ** ex.volume - 1)), 1000)
+        v["signal_3mois"] = col[1].number_input("Mois déclarés sur les 3 derniers connus", 0, 3, int(ex.signal_3mois))
+        v["signal_12mois"] = col[1].number_input("Mois déclarés sur les 12 derniers connus", 0, 12, int(ex.signal_12mois))
+        v["signal_24mois"] = col[1].number_input("Mois déclarés sur les 24 derniers connus", 0, 24, int(ex.signal_24mois))
+        nb_decl = col[1].number_input("Nombre de déclarations sur 12 mois", 0, 500,
+                                      int(round(np.expm1(ex.nb_declarations_12mois))))
+        v["mois_depuis_declaration"] = col[1].number_input("Mois depuis la dernière déclaration (60 = jamais)", 0, 60,
+                                                           int(ex.mois_depuis_declaration))
+        v["classe_signalee"] = col[2].number_input("Part de la famille ATC déclarée (0 à 1)", 0.0, 1.0,
+                                                   float(ex.classe_signalee), 0.05)
+        v["equivalents_declares"] = col[2].number_input("Part des équivalents déclarés (0 à 1)", 0.0, 1.0,
+                                                        float(ex.equivalents_declares), 0.05)
+        v["ventes_traitement_3mois"] = col[2].number_input("Ventes de tous les équivalents / normal", 0.0, 2.0,
+                                                           float(ex.ventes_traitement_3mois), 0.05)
+        v["part_marche"] = col[2].number_input("Part des ventes parmi les équivalents (0 à 1)", 0.0, 1.0,
+                                               float(min(1.0, ex.part_marche)), 0.05)
+        v["n_labos"] = col[2].number_input("Nombre de laboratoires", 1, 10, int(max(1, ex.n_labos)))
+        v["n_equivalents"] = col[2].number_input("Nombre d'équivalents", 1, 30, int(max(1, ex.n_equivalents)))
+        v["mitm"] = int(col[2].checkbox("Intérêt thérapeutique majeur (MITM)", bool(ex.mitm)))
+        v["injectable"] = int(col[2].checkbox("Injectable", bool(ex.injectable)))
+        st.form_submit_button("Recalculer la prédiction", type="primary")
+    incoherences = []
+    if not v["signal_3mois"] <= v["signal_12mois"] <= v["signal_24mois"]:
+        incoherences.append("les mois déclarés doivent croître : 3 derniers ≤ 12 derniers ≤ 24 derniers")
+    derniere = v["mois_depuis_declaration"] - S["retard"]          # en mois avant le dernier mois connu
+    if v["signal_3mois"] > 0 and derniere > 2:
+        incoherences.append(f"déclaré sur les 3 derniers mois connus, donc « mois depuis la dernière déclaration » "
+                            f"devrait valoir au plus {S['retard'] + 2}")
+    if v["signal_24mois"] == 0 and v["mois_depuis_declaration"] < 60 and derniere <= 23:
+        incoherences.append("aucun mois déclaré sur 24, donc « mois depuis la dernière déclaration » devrait dépasser "
+                            f"{S['retard'] + 23} (60 = jamais)")
+    if incoherences:
+        st.warning("Valeurs incohérentes entre elles, la prédiction sera peu fiable : " + " ; ".join(incoherences) + ".")
+    v["volume"] = float(np.log10(boites + 1))
+    v["nb_declarations_12mois"] = float(np.log1p(nb_decl))
+    v["un_seul_labo"] = int(v["n_labos"] == 1)
+    sim = pd.DataFrame([v])[moteur.VARIABLES]
+    p3, p4 = T["v3"].predict_proba(sim)[:, 1][0], T["v4"].predict_proba(sim)[:, 1][0]
+    pts = int(moteur.v2_points(sim).iloc[0])
+    c = st.columns(4)
+    c[0].metric("V1 répéter le passé", f"{v['signal_12mois']} mois", f"{v['signal_12mois'] - int(ex.v1)} par rapport à l'exemple")
+    c[1].metric("V2 points à la main", points(pts), f"{pts - int(ex.v2)} par rapport à l'exemple")
+    c[2].metric("V3 points appris", pct(p3), f"{(p3 - ex.v3) * 100:+.1f} points".replace(".", ","), delta_color="inverse")
+    c[3].metric("V4 machine learning", pct(p4), f"{(p4 - ex.v4) * 100:+.1f} points".replace(".", ","), delta_color="inverse")
+    t_sim = par_tranche[(par_tranche.Risque_min <= p4)].tranche.max()
+    t_sim = 0 if pd.isna(t_sim) else int(t_sim)
+    ls = par_tranche.iloc[t_sim]
+    st.write(f"Avec ces valeurs, la V4 annonce **{pct(p4)}** (niveau **{moteur.niveau([p4], moyenne)[0]}**, "
+             f"{f'{p4 / moyenne:.1f}'.replace('.', ',')} fois la moyenne). Dans le jeu de test, les exemples de la "
+             f"même tranche de risque (n° {t_sim + 1}) ont vraiment été déclarés dans **{pct(ls.Réel)}** des cas.")
+
+
+# ================================================================ 5. MISE À JOUR
 else:
     st.title("Mise à jour des données")
     st.write("Le traitement est **automatique** : au lancement, l'application compare les fichiers de "
